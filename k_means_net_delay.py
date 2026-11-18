@@ -274,7 +274,18 @@ class Heads:
 
 # ========================================================== the net task
 def load_graph(design):
-    import dgl      # torch/dgl are only needed to (re)build the feature cache
+    # torch/dgl are only needed to (re)build the feature cache.  DGL's last
+    # Windows build (2.2.1) needs Python <= 3.12: under a newer interpreter
+    # `import dgl` is either missing or an ancient 0.1.x whose DLL fails to load.
+    try:
+        import dgl
+    except (ImportError, OSError) as e:
+        venv_python = paths.TIMING_PREDICT_DIR / '.venv312' / 'Scripts' / 'python.exe'
+        raise RuntimeError(
+            'Building the feature cache for {!r} needs DGL 2.2.1, which only runs on Python <= 3.12 '
+            '(this is Python {}.{}).  Run this script with the TimingPredict venv instead:\n    {} {}'.format(
+                design, sys.version_info[0], sys.version_info[1], venv_python,
+                os.path.basename(sys.argv[0]) or '<script>.py')) from e
     return dgl.load_graphs(os.path.join(dataset_path, '{}.graph.bin'.format(design)))[0][0]
 
 
@@ -551,15 +562,19 @@ def read_csv(path):
 
 # ============================================================ the search
 class Runner:
-    def __init__(self, task, out, quick):
+    def __init__(self, task, out, quick, max_iter=None):
         self.task, self.out, self.quick = task, out, quick
+        # cap on Lloyd iterations / mini-batch epochs of every fit (None: SkKMeans defaults)
+        self.max_iter = max_iter
+        self.iter_kw = {} if max_iter is None else dict(max_iter=max_iter, max_epochs=max_iter)
         self.train = list(QUICK_TRAIN) if quick else sorted(train_data_keys)
         self.test = list(QUICK_TEST) if quick else sorted(test_data_keys)
         t = time.time()
         self.data = {d: load_block(task, d) for d in self.train + self.test}
-        log('{} | engine {} | {} train designs ({} samples), {} test designs ({} samples) | {:.1f}s'.format(
+        log('{} | engine {} | {} train designs ({} samples), {} test designs ({} samples) | max iter {} | {:.1f}s'.format(
             task.title, ENGINE, len(self.train), sum(len(self.data[d]['y']) for d in self.train),
-            len(self.test), sum(len(self.data[d]['y']) for d in self.test), time.time() - t))
+            len(self.test), sum(len(self.data[d]['y']) for d in self.test),
+            'default' if max_iter is None else max_iter, time.time() - t))
         cv = np.concatenate([task.class_value(self.data[d]['y']) for d in self.train])
         self.edges = np.quantile(cv, np.linspace(0, 1, N_CLASSES + 1)[1:-1])
         by_size = sorted(self.train, key=lambda d: -len(self.data[d]['y']))
@@ -618,7 +633,8 @@ class Runner:
         prep = Prep(task, cfg['featset'], cfg['transform']).fit(X)
         Xs = prep(X)
         del X
-        est = SkKMeans(cfg['k'], init=cfg['init'], n_init=cfg['n_init'], algorithm=cfg['algorithm'])
+        est = SkKMeans(cfg['k'], init=cfg['init'], n_init=cfg['n_init'], algorithm=cfg['algorithm'],
+                       **self.iter_kw)
         t0 = time.time()
         est.fit(Xs, callback=history(Xs, Y, prep) if history else None)
         info = {'fit_s': time.time() - t0, 'n_iter': int(est.n_iter_),
@@ -835,7 +851,7 @@ class Runner:
                  **{'pred_{}'.format(i): te['pred'][h] for i, h in enumerate(heads)})
         np.savez(out / 'k5_test_clusters.npz', lab=info5['kept']['test']['lab'], xy=info5['kept']['test']['xy'])
         summary = dict(
-            task=task.title, engine=ENGINE, quick=self.quick,
+            task=task.title, engine=ENGINE, quick=self.quick, max_iter=self.max_iter,
             label_space=task.space if task.allpin else 'ns',
             train_designs=self.train, test_designs=self.test,
             n_train_samples=int(sum(len(self.data[d]['y']) for d in self.train)),
@@ -1115,15 +1131,21 @@ def replot(task, out):
 def main(task, script):
     ap = argparse.ArgumentParser(description='k-means {} prediction ({} engine)'.format(task.title, ENGINE))
     ap.add_argument('--quick', action='store_true', help='7 small designs and a small grid (a smoke test)')
-    ap.add_argument('--out', help='results directory (default results/<script>[_quick])')
+    ap.add_argument('--out', help='results directory (default results/<script>[_quick][_iter<N>])')
+    ap.add_argument('--max-iter', type=int, metavar='N',
+                    help='cap every k-means fit at N Lloyd iterations / mini-batch epochs '
+                         '(e.g. 4 for a short check run); default: run to convergence')
     ap.add_argument('--replot', action='store_true', help='only redraw the figures of a finished run')
     args = ap.parse_args()
-    out = Path(args.out) if args.out else Path(result_path) / (script + ('_quick' if args.quick else ''))
+    if args.max_iter is not None and args.max_iter < 1:
+        ap.error('--max-iter must be at least 1')
+    suffix = ('_quick' if args.quick else '') + ('' if args.max_iter is None else '_iter{}'.format(args.max_iter))
+    out = Path(args.out) if args.out else Path(result_path) / (script + suffix)
     if args.replot:
         return replot(task, out)
     out.mkdir(parents=True, exist_ok=True)
     with tee.StdoutTee(str(out / 'stdout.log'), mode='w'):
-        r = Runner(task, out, args.quick)
+        r = Runner(task, out, args.quick, max_iter=args.max_iter)
         r.search()
         r.finish()
 
